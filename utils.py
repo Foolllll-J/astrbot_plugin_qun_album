@@ -6,7 +6,7 @@ from typing import Optional
 from aiocqhttp import CQHttp
 import aiohttp
 from astrbot.api import logger
-from astrbot.core.message.components import Image, Plain, Reply
+from astrbot.core.message.components import Image, Plain, Reply, At
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
@@ -93,7 +93,7 @@ def get_replyer_id(event: AiocqhttpMessageEvent) -> str | None:
         rid = reply_seg.sender_id
         return str(rid) if rid else None
 
-def get_reply_text(event: AiocqhttpMessageEvent) -> str:
+async def get_reply_text_async(event: AiocqhttpMessageEvent) -> str:
     """
     获取引用消息的文本
     """
@@ -103,7 +103,10 @@ def get_reply_text(event: AiocqhttpMessageEvent) -> str:
     if reply_seg and reply_seg.chain:
         for seg in reply_seg.chain:
             if isinstance(seg, Plain):
-                text = seg.text
+                text += seg.text
+            elif isinstance(seg, At):
+                name = getattr(seg, "name", "")
+                text += f"@{name} "
     return text
 
 async def get_user_name(client: CQHttp, user_id: int, group_id: int = 0) -> str:
@@ -118,3 +121,150 @@ async def get_user_name(client: CQHttp, user_id: int, group_id: int = 0) -> str:
             return name
     name = (await client.get_stranger_info(user_id=user_id)).get("nickname")
     return name or "未知"
+
+async def check_group_level_permission(event: AiocqhttpMessageEvent, level_threshold: int) -> tuple[bool, int]:
+    """
+    检查群成员等级权限
+    返回: (是否允许, 当前等级)
+    """
+    if level_threshold <= 0:
+        return True, 0
+    
+    try:
+        group_id = int(event.get_group_id())
+        user_id = int(event.get_sender_id())
+        info = await event.bot.get_group_member_info(
+            group_id=group_id, user_id=user_id, no_cache=True
+        )
+        level = int(info.get("level", 0))
+        role = info.get("role", "unknown")
+        
+        # 如果是管理员或群主，直接通过
+        if role in ["owner", "admin"]:
+            return True, level
+            
+        if level >= level_threshold:
+            return True, level
+            
+        return False, level
+    except Exception as e:
+        logger.warning(f"获取群成员等级失败: {e}")
+        # 获取失败时默认放行
+        return True, 0
+
+async def get_message_history(event: AiocqhttpMessageEvent, count: int) -> list[dict]:
+    """
+    获取回复的消息及其之上的 count-1 条消息。
+    """
+    # 获取被回复的消息 ID
+    reply_seg = next((seg for seg in event.get_messages() if isinstance(seg, Reply)), None)
+    if reply_seg:
+        reply_msg_id = getattr(reply_seg, "id", None) or getattr(reply_seg, "message_id", None)
+        logger.debug(f"[qun_album] 从 Reply 组件解析 reply_msg_id: {reply_msg_id}, Reply 对象: {reply_seg}")
+    else:
+        logger.debug(f"[qun_album] 未能解析到回复消息 ID. 消息链: {event.get_messages()}")
+        return []
+
+    reply_msg_id = str(reply_msg_id)
+    group_id = int(event.get_group_id())
+    logger.debug(f"[qun_album] 开始迭代搜索. 目标 ID: {reply_msg_id}, 群号: {group_id}, 计划获取数量: {count}")
+
+    try:
+        # 1. 先获取目标消息的时间戳，用于后续范围判定
+        target_msg_res = await event.bot.get_msg(message_id=reply_msg_id)
+        target_time = target_msg_res.get("time") if isinstance(target_msg_res, dict) else None
+        
+        if not target_time:
+            logger.error(f"[qun_album] 无法获取目标消息 {reply_msg_id} 的时间戳")
+            return []
+            
+        logger.debug(f"[qun_album] 目标消息时间戳: {target_time}")
+
+        # 2. 采用迭代搜索的方式，从最新消息开始逐步扩大范围
+        # 起始 100 条，其次 1000，然后 2000 依次翻倍，上限 32000
+        search_counts = [100, 1000, 2000, 4000, 8000, 16000, 32000]
+        target_messages = []
+        
+        for search_count in search_counts:
+            # 获取最新的 search_count 条消息，使用正序获取，即 [旧, ..., 最新]
+            res = await event.bot.get_group_msg_history(
+                group_id=group_id, 
+                message_seq=0, 
+                count=search_count,
+                reverseOrder=False
+            )
+            
+            messages = res.get("messages", []) if isinstance(res, dict) else res
+            if not messages:
+                continue
+            
+            # 获取当前批次最老的消息时间
+            earliest_time = messages[0].get("time")
+            logger.debug(f"[qun_album] 搜索范围 {search_count}: 最早时间 {earliest_time}, 目标时间 {target_time}")
+
+            # 如果当前批次的最早时间已经早于或等于目标时间，说明目标消息必然在当前批次内
+            if earliest_time <= target_time:
+                # 查找目标消息在当前列表中的位置
+                target_idx = -1
+                for i, msg in enumerate(messages):
+                    if str(msg.get("message_id")) == reply_msg_id:
+                        target_idx = i
+                        break
+                
+                if target_idx != -1:
+                    logger.debug(f"[qun_album] 找到目标. target_idx: {target_idx}, 计划获取有效消息数量: {count}")
+                    
+                    target_messages = []
+                    # 从 target_idx 开始往前找（往旧的方向找），直到找齐 count 条有效消息
+                    for i in range(target_idx, -1, -1):
+                        msg = messages[i]
+                        sender_id = str(msg.get("user_id") or msg.get("sender", {}).get("user_id"))
+                        text = ""
+                        raw_msg = msg.get("message")
+                        
+                        if isinstance(raw_msg, list):
+                            for seg in raw_msg:
+                                if seg.get("type") == "text":
+                                    text += seg.get("data", {}).get("text", "")
+                                elif seg.get("type") == "at":
+                                    data = seg.get('data', {})
+                                    qq = data.get('qq')
+                                    name = data.get('name')
+                                    if not name and qq:
+                                        try:
+                                            name = await get_user_name(
+                                                client=event.bot,
+                                                group_id=group_id,
+                                                user_id=int(qq),
+                                            )
+                                        except Exception:
+                                            name = str(qq)
+                                    
+                                    if name:
+                                        text += f"@{name} "
+                        elif isinstance(raw_msg, str):
+                            text = raw_msg
+
+                        if text.strip():
+                            target_messages.append({
+                                "user_id": sender_id,
+                                "text": text,
+                                "message_id": msg.get("message_id")
+                            })
+                        
+                        if len(target_messages) >= count:
+                            break
+                    
+                    target_messages.reverse()
+                    
+                    logger.debug(f"[qun_album] 最终获取到的有效消息列表(正序): {[m['text'] for m in target_messages]}")
+                    return target_messages
+                else:
+                    logger.warning(f"[qun_album] 时间戳判定在范围内但未找到 ID: {reply_msg_id}，继续扩大搜索范围")
+                        
+        logger.error(f"在最近 32000 条消息中未找到目标消息 ID: {reply_msg_id}")
+        return []
+        
+    except Exception as e:
+        logger.error(f"获取历史记录失败: {e}")
+        return []
