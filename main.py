@@ -8,15 +8,15 @@ from astrbot.core import AstrBotConfig
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
-from .draw import generate_meme, generate_stitched_meme
-from .utils import get_first_image, get_message_history, check_group_level_permission
+from .src.draw import generate_meme, generate_stitched_meme
+from .src.utils import get_first_image, get_message_history, check_group_level_permission
 
 
 @register(
     "astrbot_plugin_qun_album",
-    "Zhalslar",
+    "Zhalslar&Foolllll",
     "群相册插件，记录群友怪话",
-    "1.0.4",
+    "1.2.0",
 )
 class AdminPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -106,5 +106,3 @@ class AdminPlugin(Star):
 
         if not self.conf["save_image"]:
             os.remove(save_path)
-
-
